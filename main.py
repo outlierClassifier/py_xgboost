@@ -158,7 +158,7 @@ async def train_model(request: TrainingRequest):
                 if len(signal.values) == 0:
                     continue
                 # Generate sliding windows for the signal values
-                windows = sliding_window(signal.values, window_size=48, overlap=0.)
+                windows = sliding_window(signal.values, window_size=48, overlap=0.5)
                 # Extract features from each window
                 for window in windows:
                     features = extract_features(window)
@@ -271,7 +271,7 @@ async def predict(request: PredictionRequest):
                     continue
                 
                 # Generate sliding windows for the signal values
-                windows = sliding_window(signal.values, window_size=16, overlap=0.)
+                windows = sliding_window(signal.values, window_size=48, overlap=0.5)
                 
                 # Extract features from each window and predict for each
                 i = 0
