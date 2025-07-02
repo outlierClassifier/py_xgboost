@@ -1,5 +1,5 @@
 import re
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 import uvicorn
 import xgboost as xgb
 import numpy as np
@@ -10,6 +10,7 @@ import time
 import datetime
 import os
 import pickle
+import asyncio
 import psutil
 import logging
 
@@ -174,6 +175,16 @@ def train_from_discharges(discharges: List[Discharge]) -> float:
 
     return (time.time() - start_execution) * 1000
 
+async def train_async(discharges: List[Discharge]):
+    """Run training in a background thread so the API stays responsive."""
+    global expected_discharges, training_buffer, last_training_time
+    try:
+        await asyncio.to_thread(train_from_discharges, discharges)
+        last_training_time = datetime.datetime.now().isoformat()
+    finally:
+        training_buffer = []
+        expected_discharges = None
+
 @app.post("/train", response_model=StartTrainingResponse)
 async def start_training(request: StartTrainingRequest):
     global expected_discharges, training_buffer
@@ -184,8 +195,8 @@ async def start_training(request: StartTrainingRequest):
     return StartTrainingResponse(expectedDischarges=expected_discharges)
 
 @app.post("/train/{ordinal}", response_model=DischargeAck)
-async def push_discharge(ordinal: int, discharge: Discharge):
-    global expected_discharges, training_buffer, last_training_time
+async def push_discharge(ordinal: int, discharge: Discharge, background_tasks: BackgroundTasks):
+    global expected_discharges, training_buffer
     if expected_discharges is None:
         raise HTTPException(status_code=400, detail="Training session not started")
     if ordinal != len(training_buffer) + 1 or ordinal > expected_discharges:
@@ -193,12 +204,8 @@ async def push_discharge(ordinal: int, discharge: Discharge):
     training_buffer.append(discharge)
     ack = DischargeAck(ordinal=ordinal, totalDischarges=expected_discharges)
     if ordinal == expected_discharges:
-        try:
-            exec_time = train_from_discharges(training_buffer)
-            last_training_time = datetime.datetime.now().isoformat()
-        finally:
-            training_buffer = []
-            expected_discharges = None
+        # Start training asynchronously so the API responds immediately
+        background_tasks.add_task(train_async, training_buffer.copy())
     return ack
 
 @app.post("/predict", response_model=PredictionResponse)
