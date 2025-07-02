@@ -157,7 +157,9 @@ def train_from_discharges(discharges: List[Discharge]) -> float:
     y_array = np.array(y)
 
     # We should apply scale_pos_weight as the dataset is likely imbalanced
-    scale_pos_weight = len(y_array) / np.sum(y_array) if np.sum(y_array) > 0 else 1.0
+    pos_count = np.sum(y_array == 1)
+    neg_count = np.sum(y_array == 0)
+    scale_pos_weight = neg_count / pos_count if pos_count > 0 else 1.0
     logger.info(f"Training with {len(X_array)} samples, {len(y_array)} labels, scale_pos_weight={scale_pos_weight}")
 
     params = {
