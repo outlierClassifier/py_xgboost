@@ -19,36 +19,33 @@ logger = logging.getLogger(__name__)
 
 # Define Pydantic models for request/response based on API schemas
 class Signal(BaseModel):
-    fileName: str
+    filename: str
     values: List[float]
-    times: Optional[List[float]] = None
-    length: Optional[int] = None
 
 class Discharge(BaseModel):
     id: str
-    times: Optional[List[float]] = None
-    length: Optional[int] = None
-    anomalyTime: Optional[float] = None
     signals: List[Signal]
-
-class PredictionRequest(BaseModel):
-    discharges: List[Discharge]
+    times: List[float]
+    length: int
+    anomalyTime: Optional[float] = None
 
 class PredictionResponse(BaseModel):
-    prediction: int
+    prediction: str
     confidence: float
     executionTimeMs: float
     model: str
     details: Optional[Dict[str, Any]] = None
 
-class TrainingOptions(BaseModel):
-    epochs: Optional[int] = None
-    batchSize: Optional[int] = None
-    hyperparameters: Optional[Dict[str, Any]] = None
+class StartTrainingRequest(BaseModel):
+    totalDischarges: int = Field(..., ge=1)
+    timeoutSeconds: int = Field(..., ge=1)
 
-class TrainingRequest(BaseModel):
-    discharges: List[Discharge]
-    options: Optional[TrainingOptions] = None
+class StartTrainingResponse(BaseModel):
+    expectedDischarges: int = Field(..., ge=0)
+
+class DischargeAck(BaseModel):
+    ordinal: int = Field(..., ge=1)
+    totalDischarges: int = Field(..., ge=1)
 
 class TrainingMetrics(BaseModel):
     accuracy: Optional[float] = None
@@ -62,17 +59,10 @@ class TrainingResponse(BaseModel):
     metrics: Optional[TrainingMetrics] = None
     executionTimeMs: float
 
-class MemoryInfo(BaseModel):
-    total: float
-    used: float
-
 class HealthCheckResponse(BaseModel):
-    status: str
-    version: str
+    name: str
     uptime: float
-    memory: MemoryInfo
-    load: float
-    lastTraining: Optional[str] = None
+    lastTraining: Optional[str]
 
 class ErrorResponse(BaseModel):
     error: str
@@ -91,6 +81,9 @@ MODEL_PATH = "xgboost_model.pkl"
 start_time = time.time()
 last_training_time = None
 model = None
+# Training session state
+training_buffer: List[Discharge] = []
+expected_discharges: Optional[int] = None
 
 # Load model if exists
 if os.path.exists(MODEL_PATH):
@@ -141,104 +134,78 @@ def is_anomaly(discharge: Discharge) -> bool:
     """Determine if a discharge has an anomaly based on anomalyTime"""
     return discharge.anomalyTime is not None
 
-@app.post("/train", response_model=TrainingResponse)
-async def train_model(request: TrainingRequest):
-    global model, last_training_time
-    
-    start_execution = time.time()
-    
-    try:
-        # Extract features and labels from training data
-        X = []
-        y = []
-        
-        for discharge in request.discharges:
-            # Extract features from each signal in the discharge
-            for signal in discharge.signals:
-                if len(signal.values) == 0:
-                    continue
-                # Generate sliding windows for the signal values
-                windows = sliding_window(signal.values, window_size=48, overlap=0.5)
-                # Extract features from each window
-                for window in windows:
-                    features = extract_features(window)
-                    X.append(features[0])
-                    y.append(1 if is_anomaly(discharge) else 0)
+def train_from_discharges(discharges: List[Discharge]) -> float:
+    """Train XGBoost model using a list of discharges.
+    Returns the execution time in milliseconds."""
+    global model
 
-        X_array = np.array(X)
-        y_array = np.array(y)
-        
-        logger.info(f"Training data shape: {X_array.shape}, Labels: {np.sum(y_array)} anomalies out of {len(y_array)}")
-            
-        # Set up XGBoost parameters (can be overridden by options)
-        params = {
-            'objective': 'binary:logistic',
-            'eval_metric': 'logloss',
-            'max_depth': 8,                 # Aumenta el riesgo de overfitting, pero aporta expresividad
-            'eta': 0.02,                    # Reduce overfitting. Tenemos muchos datos, por lo que nos podemos permitir un valor bajo
-            'gamma': 1.0,                   # Valor medio, no necesitamos muchas divisiones, pero el modelo es complejo
-            'min_child_weight': 3,          # En nuestro caso, los patrones no son nada sutiles. No nos hace falta fijarnos en los detalles
-            'subsample': 1.0,               # Queremos aprovechar todo el dataset
-            'colsample_bytree': 0.8,        # Reduce la correlacion entre arboles
-        }
-        
-        # Apply custom hyperparameters if provided
-        if request.options and request.options.hyperparameters:
-            for param, value in request.options.hyperparameters.items():
-                params[param] = value
-        
-        # Convert data to DMatrix format for XGBoost
-        dtrain = xgb.DMatrix(X_array, label=y_array)
-        
-        # Train the model
-        num_rounds = 10000  # Default rounds
-        if request.options and request.options.epochs:
-            num_rounds = request.options.epochs
-            
-        model = xgb.train(params, dtrain, num_rounds)
-        
-        # Save the trained model
-        with open(MODEL_PATH, "wb") as f:
-            pickle.dump(model, f)
-            
-        # Update last training time
-        last_training_time = datetime.datetime.now().isoformat()
-        
-        # Calculate execution time
-        execution_time = (time.time() - start_execution) * 1000  # ms
-        
-        # Generate training ID
-        training_id = f"train_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        
-        return TrainingResponse(
-            status="success",
-            message="Training completed successfully",
-            trainingId=training_id,
-            metrics=TrainingMetrics(
-                accuracy=0.85,  # Placeholder for actual accuracy
-                f1Score=0.8,    # Placeholder for actual F1 score
-                loss=0.1,       # Placeholder for actual loss
-            ),
-            executionTimeMs=execution_time
-        )
-        
-    except Exception as e:
-        logger.error(f"Training error: {str(e)}")
-        raise HTTPException(
-            status_code=500, 
-            detail=ErrorResponse(
-                error="Training failed",
-                code="TRAINING_ERROR",
-                details={"message": str(e)}
-            ).dict()
-        )
+    start_execution = time.time()
+
+    X, y = [], []
+    for discharge in discharges:
+        for signal in discharge.signals:
+            if len(signal.values) == 0:
+                continue
+            windows = sliding_window(signal.values, window_size=48, overlap=0.5)
+            for window in windows:
+                features = extract_features(window)
+                X.append(features[0])
+                y.append(1 if is_anomaly(discharge) else 0)
+
+    X_array = np.array(X)
+    y_array = np.array(y)
+
+    params = {
+        'objective': 'binary:logistic',
+        'eval_metric': 'logloss',
+        'max_depth': 8,
+        'eta': 0.02,
+        'gamma': 1.0,
+        'min_child_weight': 3,
+        'subsample': 1.0,
+        'colsample_bytree': 0.8,
+    }
+
+    dtrain = xgb.DMatrix(X_array, label=y_array)
+    model = xgb.train(params, dtrain, num_boost_round=10000)
+
+    with open(MODEL_PATH, "wb") as f:
+        pickle.dump(model, f)
+
+    return (time.time() - start_execution) * 1000
+
+@app.post("/train", response_model=StartTrainingResponse)
+async def start_training(request: StartTrainingRequest):
+    global expected_discharges, training_buffer
+    if expected_discharges is not None:
+        raise HTTPException(status_code=503, detail="Node is busy or cannot train now")
+    expected_discharges = request.totalDischarges
+    training_buffer = []
+    return StartTrainingResponse(expectedDischarges=expected_discharges)
+
+@app.post("/train/{ordinal}", response_model=DischargeAck)
+async def push_discharge(ordinal: int, discharge: Discharge):
+    global expected_discharges, training_buffer, last_training_time
+    if expected_discharges is None:
+        raise HTTPException(status_code=400, detail="Training session not started")
+    if ordinal != len(training_buffer) + 1 or ordinal > expected_discharges:
+        raise HTTPException(status_code=400, detail="Invalid ordinal")
+    training_buffer.append(discharge)
+    ack = DischargeAck(ordinal=ordinal, totalDischarges=expected_discharges)
+    if ordinal == expected_discharges:
+        try:
+            exec_time = train_from_discharges(training_buffer)
+            last_training_time = datetime.datetime.now().isoformat()
+        finally:
+            training_buffer = []
+            expected_discharges = None
+    return ack
 
 @app.post("/predict", response_model=PredictionResponse)
-async def predict(request: PredictionRequest):
+async def predict(discharge: Discharge):
     global model
     
     start_execution = time.time()
-    print(f"Received prediction request with {len(request.discharges)} discharges")
     if model is None:
         raise HTTPException(
             status_code=400,
@@ -251,22 +218,13 @@ async def predict(request: PredictionRequest):
     
     try:
         # Check if there are discharges to process
-        if len(request.discharges) == 0:
-            raise HTTPException(
-                status_code=400,
-                detail=ErrorResponse(
-                    error="No discharge data provided",
-                    code="INVALID_INPUT"
-                ).dict()
-            )
             
         # Process all discharges for prediction
         all_predictions = []
         all_confidences = []
         wheighted_predictions = []
+        for signal in discharge.signals:
 
-        for discharge in request.discharges:
-            for signal in discharge.signals:
                 if len(signal.values) == 0:
                     continue
                 
@@ -309,14 +267,14 @@ async def predict(request: PredictionRequest):
         execution_time = (time.time() - start_execution) * 1000  # ms
         
         return PredictionResponse(
-            prediction=final_prediction,
+            prediction="Anomaly" if final_prediction == 1 else "Normal",
             confidence=float(avg_confidence),
             executionTimeMs=execution_time,
             model="xgboost",
             details={
                 "individualPredictions": all_predictions,
                 "individualConfidences": all_confidences,
-                "numDischargesProcessed": len(request.discharges),
+                "numDischargesProcessed": 1,
                 "featureImportance": feature_importance
             }
         )
@@ -334,19 +292,10 @@ async def predict(request: PredictionRequest):
 
 @app.get("/health", response_model=HealthCheckResponse)
 async def health_check():
-    # Get memory information
-    mem = psutil.virtual_memory()
-    
     return HealthCheckResponse(
-        status="online" if model is not None else "degraded",
-        version="1.0.0",
+        name="xgboost",
         uptime=time.time() - start_time,
-        memory=MemoryInfo(
-            total=mem.total / (1024*1024),  # Convert to MB
-            used=mem.used / (1024*1024)
-        ),
-        load=psutil.cpu_percent() / 100,
-        lastTraining=last_training_time
+        lastTraining=last_training_time,
     )
 
 # Custom middleware to handle large request JSON payloads
