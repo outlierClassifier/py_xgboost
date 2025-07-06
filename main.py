@@ -1,9 +1,7 @@
-import re
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 import uvicorn
 import xgboost as xgb
 import numpy as np
-import json
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 import time
@@ -11,7 +9,6 @@ import datetime
 import os
 import pickle
 import asyncio
-import psutil
 import logging
 
 # Configure logging
@@ -30,12 +27,18 @@ class Discharge(BaseModel):
     length: int
     anomalyTime: Optional[float] = None
 
+class WindowProperties(BaseModel):
+    featureValues: List[float] = Field(..., min_items=1)
+    prediction: str = Field(..., pattern=r'^(Anomaly|Normal)$')
+    justification: float
+
 class PredictionResponse(BaseModel):
     prediction: str
     confidence: float
     executionTimeMs: float
     model: str
-    details: Optional[Dict[str, Any]] = None
+    windowSize: int = 48
+    windows: List[WindowProperties]
 
 class StartTrainingRequest(BaseModel):
     totalDischarges: int = Field(..., ge=1)
@@ -216,7 +219,7 @@ async def push_discharge(ordinal: int, discharge: Discharge, background_tasks: B
     return ack
 
 @app.post("/predict", response_model=PredictionResponse)
-async def predict(discharge: Discharge):
+async def predict(discharge: Discharge, background_tasks: BackgroundTasks):
     global model
     
     start_execution = time.time()
@@ -224,10 +227,10 @@ async def predict(discharge: Discharge):
         raise HTTPException(
             status_code=400,
             detail=ErrorResponse(
-                error="Model not trained",
-                code="MODEL_NOT_FOUND",
-                details={"message": "Please train the model first"}
-            ).dict()
+            error="Model not trained",
+            code="MODEL_NOT_FOUND",
+            details={"message": "Please train the model first"}
+            ).model_dump()
         )
     
     try:
@@ -282,15 +285,17 @@ async def predict(discharge: Discharge):
         
         return PredictionResponse(
             prediction="Anomaly" if final_prediction == 1 else "Normal",
-            confidence=float(avg_confidence),
+            confidence=float(avg_confidence) if final_prediction == 1 else 1 - float(avg_confidence),
             executionTimeMs=execution_time,
             model="xgboost",
-            details={
-                "individualPredictions": all_predictions,
-                "individualConfidences": all_confidences,
-                "numDischargesProcessed": 1,
-                "featureImportance": feature_importance
-            }
+            windowSize=48,
+            windows=[
+                WindowProperties(
+                    featureValues=[float(x) for x in extract_features(window)[0].tolist()],
+                    prediction="Anomaly" if pred == 1 else "Normal",
+                    justification=float(conf) if pred == 1 else 1 - float(conf)
+                ) for window, pred, conf in zip(windows, all_predictions, all_confidences)
+            ]
         )
         
     except Exception as e:
