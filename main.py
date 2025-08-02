@@ -81,6 +81,8 @@ app = FastAPI(
 )
 
 # Global variables
+WINDOW_SIZE = 16
+SAMPLING_TIME = 2e-3  # 2ms
 MODEL_PATH = "xgboost_model.pkl"
 start_time = time.time()
 last_training_time = None
@@ -102,19 +104,36 @@ if os.path.exists(MODEL_PATH):
 def extract_features(window: list[float]) -> np.ndarray:
     """Extract features from discharge data for model training/prediction"""
     features = []
-        
-    # Extract statistical features
+
+    # Features are grouped in:
+    # - Core statistics: mean, slope, RMS
+    # - Dynamic features: maximun slope, 2nd derivative
+    # - Shape: skewness, kurtosis. Not implemented yet.
+
+    # helper variables
+    mean = np.mean(window)
+    diff = np.diff(window)
+    abs_second_derivate = np.abs(np.diff(diff))
+
     features.extend([
-        np.mean(window),
-        np.std(window),
-        np.min(window),
-        np.max(window),
-        np.median(window)
+        # Core statistics
+        mean,                                                             # Mean
+        diff.mean() * 1/SAMPLING_TIME,                                    # Slope (mean of differences) 
+        np.log1p(np.sqrt(np.mean(np.square(window)))),                    # Log-RMS
+
+        # Dynamic features
+        np.max(np.abs(diff)),                                             # Max slope
+        np.min(abs_second_derivate) * 1/(SAMPLING_TIME**2),               # Min 2nd derivative
+        np.max(abs_second_derivate) * 1/(SAMPLING_TIME**2),               # Max 2nd derivative
+        np.mean(abs_second_derivate) * 1/(SAMPLING_TIME**2),              # Mean 2nd derivative
+
+        # Shape features: skewness and kurtosis
+        # TODO: use scipy.stats for skewness and kurtosis if more complex features are needed
     ])
     
     return np.array(features).reshape(1, -1)
 
-def sliding_window(values: list[float], window_size: int = 16, overlap: float = 0.0) -> list[list[float]]:
+def sliding_window(values: list[float], window_size: int = WINDOW_SIZE, overlap: float = 0.0) -> list[list[float]]:
     """Generate sliding windows over the values"""
     step = int(window_size * (1 - overlap))
     windows = []
@@ -150,7 +169,7 @@ def train_from_discharges(discharges: List[Discharge]) -> float:
         for signal in discharge.signals:
             if len(signal.values) == 0:
                 continue
-            windows = sliding_window(signal.values, window_size=48, overlap=0.5)
+            windows = sliding_window(signal.values)
             for window in windows:
                 features = extract_features(window)
                 X.append(features[0])
@@ -219,7 +238,7 @@ async def push_discharge(ordinal: int, discharge: Discharge, background_tasks: B
     return ack
 
 @app.post("/predict", response_model=PredictionResponse)
-async def predict(discharge: Discharge, background_tasks: BackgroundTasks):
+async def predict(discharge: Discharge):
     global model
     
     start_execution = time.time()
@@ -246,7 +265,7 @@ async def predict(discharge: Discharge, background_tasks: BackgroundTasks):
                     continue
                 
                 # Generate sliding windows for the signal values
-                windows = sliding_window(signal.values, window_size=48, overlap=0.5)
+                windows = sliding_window(signal.values)
                 
                 # Extract features from each window and predict for each
                 i = 0
