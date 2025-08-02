@@ -165,13 +165,26 @@ def train_from_discharges(discharges: List[Discharge]) -> float:
     start_execution = time.time()
 
     X, y = [], []
+    num_tendency = 3 # We will add the past 3 features vectors as a tendency, to give the model more context
+    
+    if len(discharges) < num_tendency:
+        raise ValueError(f"Not enough discharges to train the model, expected at least {num_tendency}, got {len(discharges)}")
+    
     for discharge in discharges:
         for signal in discharge.signals:
             if len(signal.values) == 0:
                 continue
             windows = sliding_window(signal.values)
-            for window in windows:
+            for (i, window) in enumerate(windows):
+                if i < num_tendency:
+                    # Skip first few windows to ensure we have enough context
+                    continue
                 features = extract_features(window)
+                # Add past features as a tendency
+                for j in range(1, num_tendency + 1):
+                    if i - j >= 0:
+                        past_features = extract_features(windows[i - j])
+                        features = np.concatenate((features, past_features[0]))
                 X.append(features[0])
                 y.append(1 if is_anomaly(discharge) else 0)
 
