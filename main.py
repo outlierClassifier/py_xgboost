@@ -1,16 +1,14 @@
-import re
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 import uvicorn
 import xgboost as xgb
 import numpy as np
-import json
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 import time
 import datetime
 import os
 import pickle
-import psutil
+import asyncio
 import logging
 
 # Configure logging
@@ -19,36 +17,39 @@ logger = logging.getLogger(__name__)
 
 # Define Pydantic models for request/response based on API schemas
 class Signal(BaseModel):
-    fileName: str
+    filename: str
     values: List[float]
-    times: Optional[List[float]] = None
-    length: Optional[int] = None
 
 class Discharge(BaseModel):
     id: str
-    times: Optional[List[float]] = None
-    length: Optional[int] = None
-    anomalyTime: Optional[float] = None
     signals: List[Signal]
+    times: List[float]
+    length: int
+    anomalyTime: Optional[float] = None
 
-class PredictionRequest(BaseModel):
-    discharges: List[Discharge]
+class WindowProperties(BaseModel):
+    featureValues: List[float] = Field(..., min_items=1)
+    prediction: str = Field(..., pattern=r'^(Anomaly|Normal)$')
+    justification: float
 
 class PredictionResponse(BaseModel):
-    prediction: int
+    prediction: str
     confidence: float
     executionTimeMs: float
     model: str
-    details: Optional[Dict[str, Any]] = None
+    windowSize: int = 48
+    windows: List[WindowProperties]
 
-class TrainingOptions(BaseModel):
-    epochs: Optional[int] = None
-    batchSize: Optional[int] = None
-    hyperparameters: Optional[Dict[str, Any]] = None
+class StartTrainingRequest(BaseModel):
+    totalDischarges: int = Field(..., ge=1)
+    timeoutSeconds: int = Field(..., ge=1)
 
-class TrainingRequest(BaseModel):
-    discharges: List[Discharge]
-    options: Optional[TrainingOptions] = None
+class StartTrainingResponse(BaseModel):
+    expectedDischarges: int = Field(..., ge=0)
+
+class DischargeAck(BaseModel):
+    ordinal: int = Field(..., ge=1)
+    totalDischarges: int = Field(..., ge=1)
 
 class TrainingMetrics(BaseModel):
     accuracy: Optional[float] = None
@@ -62,17 +63,10 @@ class TrainingResponse(BaseModel):
     metrics: Optional[TrainingMetrics] = None
     executionTimeMs: float
 
-class MemoryInfo(BaseModel):
-    total: float
-    used: float
-
 class HealthCheckResponse(BaseModel):
-    status: str
-    version: str
+    name: str
     uptime: float
-    memory: MemoryInfo
-    load: float
-    lastTraining: Optional[str] = None
+    lastTraining: Optional[str]
 
 class ErrorResponse(BaseModel):
     error: str
@@ -87,10 +81,15 @@ app = FastAPI(
 )
 
 # Global variables
+WINDOW_SIZE = 16
+SAMPLING_TIME = 2e-3  # 2ms
 MODEL_PATH = "xgboost_model.pkl"
 start_time = time.time()
 last_training_time = None
 model = None
+# Training session state
+training_buffer: List[Discharge] = []
+expected_discharges: Optional[int] = None
 
 # Load model if exists
 if os.path.exists(MODEL_PATH):
@@ -104,20 +103,47 @@ if os.path.exists(MODEL_PATH):
 # Helper functions
 def extract_features(window: list[float]) -> np.ndarray:
     """Extract features from discharge data for model training/prediction"""
+
+    if len(window) == 0:
+        raise ValueError("Window cannot be empty")
+
     features = []
-        
-    # Extract statistical features
+
+    # Features are grouped in:
+    # - Core statistics: mean, slope, RMS
+    # - Dynamic features: maximun slope, 2nd derivative
+    # - Shape: skewness, kurtosis. Not implemented yet.
+
+    # helper variables
+    mean = np.mean(window)
+    if len(window) > 1:
+        diff = np.diff(window)
+    else:
+        diff = np.array([0.0])
+
+    if len(window) > 2:
+        abs_second_derivate = np.abs(np.diff(diff))
+    else:
+        abs_second_derivate = np.array([0.0])
+
     features.extend([
-        np.mean(window),
-        np.std(window),
-        np.min(window),
-        np.max(window),
-        np.median(window)
+        # Core statistics
+        mean,                                                             # Mean
+        diff.mean() * 1/SAMPLING_TIME,                                    # Slope (mean of differences) 
+        np.log1p(np.sqrt(np.mean(np.square(window)))),                    # Log-RMS
+
+        # Dynamic features
+        np.max(np.abs(diff)),                                             # Max slope
+        np.min(abs_second_derivate) * 1/(SAMPLING_TIME**2),               # Min 2nd derivative
+        np.max(abs_second_derivate) * 1/(SAMPLING_TIME**2),               # Max 2nd derivative
+        np.mean(abs_second_derivate) * 1/(SAMPLING_TIME**2),              # Mean 2nd derivative
+
+        # Shape features: skewness and kurtosis
+        # TODO: use scipy.stats for skewness and kurtosis if more complex features are needed
     ])
-    
     return np.array(features).reshape(1, -1)
 
-def sliding_window(values: list[float], window_size: int = 16, overlap: float = 0.0) -> list[list[float]]:
+def sliding_window(values: list[float], window_size: int = WINDOW_SIZE, overlap: float = 0.0) -> list[list[float]]:
     """Generate sliding windows over the values"""
     step = int(window_size * (1 - overlap))
     windows = []
@@ -141,104 +167,155 @@ def is_anomaly(discharge: Discharge) -> bool:
     """Determine if a discharge has an anomaly based on anomalyTime"""
     return discharge.anomalyTime is not None
 
-@app.post("/train", response_model=TrainingResponse)
-async def train_model(request: TrainingRequest):
-    global model, last_training_time
-    
-    start_execution = time.time()
-    
-    try:
-        # Extract features and labels from training data
-        X = []
-        y = []
-        
-        for discharge in request.discharges:
-            # Extract features from each signal in the discharge
-            for signal in discharge.signals:
-                if len(signal.values) == 0:
-                    continue
-                # Generate sliding windows for the signal values
-                windows = sliding_window(signal.values, window_size=48, overlap=0.5)
-                # Extract features from each window
-                for window in windows:
-                    features = extract_features(window)
-                    X.append(features[0])
-                    y.append(1 if is_anomaly(discharge) else 0)
+def train_from_discharges(discharges: List[Discharge]) -> float:
+    """Train XGBoost model using a list of discharges.
+    Returns the execution time in milliseconds."""
+    global model
 
-        X_array = np.array(X)
-        y_array = np.array(y)
+    start_execution = time.time()
+
+    X, y = [], []
+    num_tendency = 3  # We will add the past 3 features vectors as a tendency
+    feature_size = 7  # Number of features per window
+    
+    if len(discharges) < num_tendency:
+        raise ValueError(f"Not enough discharges to train the model, expected at least {num_tendency}, got {len(discharges)}")
+    
+    for discharge in discharges:
+        # Group windows from all signals by their time index
+        aligned_windows = {}
+        signal_indices = {}
         
-        logger.info(f"Training data shape: {X_array.shape}, Labels: {np.sum(y_array)} anomalies out of {len(y_array)}")
+        # First, collect windows from all signals
+        for signal_idx, signal in enumerate(discharge.signals):
+            if len(signal.values) == 0:
+                continue
+                
+            windows = sliding_window(signal.values)
+            for window_idx, window in enumerate(windows):
+                if window_idx not in aligned_windows:
+                    aligned_windows[window_idx] = []
+                    signal_indices[window_idx] = []
+                aligned_windows[window_idx].append(window)
+                signal_indices[window_idx].append(signal_idx)
+        
+        # Process aligned windows
+        for window_idx in sorted(aligned_windows.keys()):
+            if window_idx < num_tendency:
+                continue
+                
+            # Average features across all signals at this time point
+            current_window_features = np.zeros(feature_size)
+            for window in aligned_windows[window_idx]:
+                current_window_features += extract_features(window)[0]
             
-        # Set up XGBoost parameters (can be overridden by options)
-        params = {
-            'objective': 'binary:logistic',
-            'eval_metric': 'logloss',
-            'max_depth': 8,                 # Aumenta el riesgo de overfitting, pero aporta expresividad
-            'eta': 0.02,                    # Reduce overfitting. Tenemos muchos datos, por lo que nos podemos permitir un valor bajo
-            'gamma': 1.0,                   # Valor medio, no necesitamos muchas divisiones, pero el modelo es complejo
-            'min_child_weight': 3,          # En nuestro caso, los patrones no son nada sutiles. No nos hace falta fijarnos en los detalles
-            'subsample': 1.0,               # Queremos aprovechar todo el dataset
-            'colsample_bytree': 0.8,        # Reduce la correlacion entre arboles
-        }
-        
-        # Apply custom hyperparameters if provided
-        if request.options and request.options.hyperparameters:
-            for param, value in request.options.hyperparameters.items():
-                params[param] = value
-        
-        # Convert data to DMatrix format for XGBoost
-        dtrain = xgb.DMatrix(X_array, label=y_array)
-        
-        # Train the model
-        num_rounds = 10000  # Default rounds
-        if request.options and request.options.epochs:
-            num_rounds = request.options.epochs
+            if len(aligned_windows[window_idx]) > 0:
+                current_window_features /= len(aligned_windows[window_idx])
             
-        model = xgb.train(params, dtrain, num_rounds)
-        
-        # Save the trained model
-        with open(MODEL_PATH, "wb") as f:
-            pickle.dump(model, f)
+            # Create feature vector with consistent size
+            all_features = [current_window_features]
+                
+            # Add tendency features (also averaged across signals)
+            for j in range(1, num_tendency + 1):
+                prev_idx = window_idx - j
+                if prev_idx in aligned_windows and len(aligned_windows[prev_idx]) > 0:
+                    prev_window_features = np.zeros(feature_size)
+                    for window in aligned_windows[prev_idx]:
+                        prev_window_features += extract_features(window)[0]
+                    prev_window_features /= len(aligned_windows[prev_idx])
+                    all_features.append(prev_window_features)
+                else:
+                    # If no previous window, use zeros
+                    all_features.append(np.zeros(feature_size))
             
-        # Update last training time
+            # Flatten and append to feature matrix
+            X.append(np.concatenate(all_features))
+            y.append(1 if is_anomaly(discharge) else 0)
+            
+        logger.info(f"Extracted features for discharge {discharge.id}")
+
+    X_array = np.array(X)
+    y_array = np.array(y)
+
+    # We should apply scale_pos_weight as the dataset is likely imbalanced
+    pos_count = np.sum(y_array == 1)
+    neg_count = np.sum(y_array == 0)
+    scale_pos_weight = neg_count / pos_count if pos_count > 0 else 1.0
+    logger.info(f"Training with {len(X_array)} samples, {len(y_array)} labels, scale_pos_weight={scale_pos_weight}")
+
+    params = {
+        # Algorithm and hardware settings
+        'tree_method': 'hist',
+        'n_jobs': -1,
+        # Objective and evaluation metrics
+        'objective': 'binary:logistic',
+        'eval_metric': 'aucpr', # 'logloss'
+        # Regularization and overfitting control
+        'learning_rate': 0.05,
+        'scale_pos_weight': scale_pos_weight,
+        # Hyperparameters
+        'max_depth': 6,
+        'min_child_weight': 3,
+        'gamma': 1.0,
+        'eta': 0.02,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        # incremental learning
+        # 'process_type': 'update',
+        # 'refresh_leaf': true,
+    }
+
+    dtrain = xgb.DMatrix(X_array, label=y_array)
+    model = xgb.train(params, 
+                      dtrain, 
+                      num_boost_round=10000, 
+                    #   early_stopping_rounds=50 # To enable early stopping, we need a validation set
+                      verbose_eval=10
+                      )
+
+    with open(MODEL_PATH, "wb") as f:
+        pickle.dump(model, f)
+
+    return (time.time() - start_execution) * 1000
+
+async def train_async(discharges: List[Discharge]):
+    """Run training in a background thread so the API stays responsive."""
+    global expected_discharges, training_buffer, last_training_time
+    try:
+        await asyncio.to_thread(train_from_discharges, discharges)
         last_training_time = datetime.datetime.now().isoformat()
-        
-        # Calculate execution time
-        execution_time = (time.time() - start_execution) * 1000  # ms
-        
-        # Generate training ID
-        training_id = f"train_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        
-        return TrainingResponse(
-            status="success",
-            message="Training completed successfully",
-            trainingId=training_id,
-            metrics=TrainingMetrics(
-                accuracy=0.85,  # Placeholder for actual accuracy
-                f1Score=0.8,    # Placeholder for actual F1 score
-                loss=0.1,       # Placeholder for actual loss
-            ),
-            executionTimeMs=execution_time
-        )
-        
-    except Exception as e:
-        logger.error(f"Training error: {str(e)}")
-        raise HTTPException(
-            status_code=500, 
-            detail=ErrorResponse(
-                error="Training failed",
-                code="TRAINING_ERROR",
-                details={"message": str(e)}
-            ).dict()
-        )
+    finally:
+        training_buffer = []
+        expected_discharges = None
+
+@app.post("/train", response_model=StartTrainingResponse)
+async def start_training(request: StartTrainingRequest):
+    global expected_discharges, training_buffer
+    if expected_discharges is not None:
+        raise HTTPException(status_code=503, detail="Node is busy or cannot train now")
+    expected_discharges = request.totalDischarges
+    training_buffer = []
+    return StartTrainingResponse(expectedDischarges=expected_discharges)
+
+@app.post("/train/{ordinal}", response_model=DischargeAck)
+async def push_discharge(ordinal: int, discharge: Discharge, background_tasks: BackgroundTasks):
+    global expected_discharges, training_buffer
+    if expected_discharges is None:
+        raise HTTPException(status_code=400, detail="Training session not started")
+    if ordinal != len(training_buffer) + 1 or ordinal > expected_discharges:
+        raise HTTPException(status_code=400, detail="Invalid ordinal")
+    training_buffer.append(discharge)
+    ack = DischargeAck(ordinal=ordinal, totalDischarges=expected_discharges)
+    if ordinal == expected_discharges:
+        # Start training asynchronously so the API responds immediately
+        background_tasks.add_task(train_async, training_buffer.copy())
+    return ack
 
 @app.post("/predict", response_model=PredictionResponse)
-async def predict(request: PredictionRequest):
+async def predict(discharge: Discharge):
     global model
     
     start_execution = time.time()
-    print(f"Received prediction request with {len(request.discharges)} discharges")
     if model is None:
         raise HTTPException(
             status_code=400,
@@ -246,57 +323,80 @@ async def predict(request: PredictionRequest):
                 error="Model not trained",
                 code="MODEL_NOT_FOUND",
                 details={"message": "Please train the model first"}
-            ).dict()
+            ).model_dump()
         )
     
     try:
-        # Check if there are discharges to process
-        if len(request.discharges) == 0:
-            raise HTTPException(
-                status_code=400,
-                detail=ErrorResponse(
-                    error="No discharge data provided",
-                    code="INVALID_INPUT"
-                ).dict()
-            )
-            
-        # Process all discharges for prediction
+        # Group windows from all signals by their time index
+        aligned_windows = {}
+        all_windows = []  # To store all windows for response
         all_predictions = []
         all_confidences = []
         wheighted_predictions = []
-
-        for discharge in request.discharges:
-            for signal in discharge.signals:
-                if len(signal.values) == 0:
-                    continue
+        feature_size = 7
+        num_tendency = 3
+        
+        # First, collect windows from all signals
+        for signal_idx, signal in enumerate(discharge.signals):
+            if len(signal.values) == 0:
+                continue
                 
-                # Generate sliding windows for the signal values
-                windows = sliding_window(signal.values, window_size=48, overlap=0.5)
-                
-                # Extract features from each window and predict for each
-                i = 0
-                for window in windows:
-                    i += 1
-                    features = extract_features(window)
-
-                    # Convert to DMatrix
-                    dtest = xgb.DMatrix(features)
+            windows = sliding_window(signal.values)
+            all_windows.extend(windows)  # Store windows for response
             
-                    # Make prediction
-                    prediction_probability = model.predict(dtest)[0]
-                    prediction = 1 if prediction_probability > 0.5 else 0
-                    weigthted_prediction = prediction_probability if prediction == 1 else -1 + prediction_probability
-                    wheighted_predictions.append(weigthted_prediction)
+            for window_idx, window in enumerate(windows):
+                if window_idx not in aligned_windows:
+                    aligned_windows[window_idx] = []
+                aligned_windows[window_idx].append(window)
+        
+        # Process aligned windows for prediction
+        for window_idx in sorted(aligned_windows.keys()):
+            if window_idx < num_tendency:
+                continue
+                
+            # Average features across all signals at this time point
+            current_window_features = np.zeros(feature_size)
+            for window in aligned_windows[window_idx]:
+                current_window_features += extract_features(window)[0]
+            
+            if len(aligned_windows[window_idx]) > 0:
+                current_window_features /= len(aligned_windows[window_idx])
+            
+            # Create feature vector with consistent size (matching training)
+            all_features = [current_window_features]
+                
+            # Add tendency features (also averaged across signals)
+            for j in range(1, num_tendency + 1):
+                prev_idx = window_idx - j
+                if prev_idx in aligned_windows and len(aligned_windows[prev_idx]) > 0:
+                    prev_window_features = np.zeros(feature_size)
+                    for window in aligned_windows[prev_idx]:
+                        prev_window_features += extract_features(window)[0]
+                    prev_window_features /= len(aligned_windows[prev_idx])
+                    all_features.append(prev_window_features)
+                else:
+                    # If no previous window, use zeros
+                    all_features.append(np.zeros(feature_size))
+            
+            # Flatten and prepare for prediction
+            features_array = np.concatenate(all_features).reshape(1, -1)
+            dtest = xgb.DMatrix(features_array)
+            
+            # Make prediction
+            prediction_probability = model.predict(dtest)[0]
+            prediction = 1 if prediction_probability > 0.5 else 0
+            weigthted_prediction = prediction_probability if prediction == 1 else -1 + prediction_probability
+            wheighted_predictions.append(weigthted_prediction)
 
-                    all_predictions.append(prediction)
-                    all_confidences.append(float(prediction_probability if prediction == 1 else 1 - prediction_probability))
-
+            all_predictions.append(prediction)
+            all_confidences.append(float(prediction_probability if prediction == 1 else 1 - prediction_probability))
+            
         # Determine overall prediction
-        # Use majority vote for final prediction
         final_prediction = 1 if sum(wheighted_predictions) > 0 else 0
         
         # Use average confidence
         avg_confidence = np.mean(all_confidences) if all_confidences else 0.0
+        
         # Calculate feature importance if available
         feature_importance = None
         try:
@@ -307,18 +407,39 @@ async def predict(request: PredictionRequest):
             
         # Calculate execution time
         execution_time = (time.time() - start_execution) * 1000  # ms
-        
+
+        # DEBUG: Use matplotlib to visualize the feature importance and confidences
+        # import matplotlib.pyplot as plt
+
+        # if feature_importance:
+        #     plt.figure(figsize=(10, 6))
+        #     plt.barh(range(len(feature_importance)), feature_importance, align='center')
+        #     plt.xlabel('Feature Importance')
+        #     plt.ylabel('Features')
+        #     plt.title('XGBoost Feature Importance')
+        #     plt.show()
+
+        # if all_confidences:
+        #     plt.figure(figsize=(10, 6))
+        #     plt.hist(all_confidences, bins=20, alpha=0.7)
+        #     plt.xlabel('Confidence')
+        #     plt.ylabel('Frequency')
+        #     plt.title('Prediction Confidence Distribution')
+        #     plt.show()
+
         return PredictionResponse(
-            prediction=final_prediction,
-            confidence=float(avg_confidence),
+            prediction="Anomaly" if final_prediction == 1 else "Normal",
+            confidence=float(avg_confidence) if final_prediction == 1 else 1 - float(avg_confidence),
             executionTimeMs=execution_time,
             model="xgboost",
-            details={
-                "individualPredictions": all_predictions,
-                "individualConfidences": all_confidences,
-                "numDischargesProcessed": len(request.discharges),
-                "featureImportance": feature_importance
-            }
+            windowSize=48,
+            windows=[
+                WindowProperties(
+                    featureValues=[float(x) for x in extract_features(window)[0].tolist()],
+                    prediction="Anomaly" if pred == 1 else "Normal",
+                    justification=float(conf) if pred == 1 else 1 - float(conf)
+                ) for window, pred, conf in zip(windows, all_predictions, all_confidences)
+            ]
         )
         
     except Exception as e:
@@ -334,19 +455,10 @@ async def predict(request: PredictionRequest):
 
 @app.get("/health", response_model=HealthCheckResponse)
 async def health_check():
-    # Get memory information
-    mem = psutil.virtual_memory()
-    
     return HealthCheckResponse(
-        status="online" if model is not None else "degraded",
-        version="1.0.0",
+        name="xgboost",
         uptime=time.time() - start_time,
-        memory=MemoryInfo(
-            total=mem.total / (1024*1024),  # Convert to MB
-            used=mem.used / (1024*1024)
-        ),
-        load=psutil.cpu_percent() / 100,
-        lastTraining=last_training_time
+        lastTraining=last_training_time,
     )
 
 # Custom middleware to handle large request JSON payloads
@@ -360,7 +472,7 @@ async def increase_json_size_limit(request: Request, call_next):
 
 if __name__ == "__main__":
     # Set server settings for large JSON payloads
-    uvicorn.run("main:app", host="0.0.0.0", port=8003, reload=True, 
+    uvicorn.run("main:app", host="0.0.0.0", port=8003,
                 limit_concurrency=50, 
                 limit_max_requests=20000,
                 timeout_keep_alive=120)

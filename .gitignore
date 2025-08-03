@@ -1,6 +1,6 @@
 # Project-specific files
 *.pkl
-api-schemas.json
+*.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
