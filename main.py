@@ -103,6 +103,10 @@ if os.path.exists(MODEL_PATH):
 # Helper functions
 def extract_features(window: list[float]) -> np.ndarray:
     """Extract features from discharge data for model training/prediction"""
+
+    if len(window) == 0:
+        raise ValueError("Window cannot be empty")
+
     features = []
 
     # Features are grouped in:
@@ -112,8 +116,15 @@ def extract_features(window: list[float]) -> np.ndarray:
 
     # helper variables
     mean = np.mean(window)
-    diff = np.diff(window)
-    abs_second_derivate = np.abs(np.diff(diff))
+    if len(window) > 1:
+        diff = np.diff(window)
+    else:
+        diff = np.array([0.0])
+
+    if len(window) > 2:
+        abs_second_derivate = np.abs(np.diff(diff))
+    else:
+        abs_second_derivate = np.array([0.0])
 
     features.extend([
         # Core statistics
@@ -130,7 +141,6 @@ def extract_features(window: list[float]) -> np.ndarray:
         # Shape features: skewness and kurtosis
         # TODO: use scipy.stats for skewness and kurtosis if more complex features are needed
     ])
-    
     return np.array(features).reshape(1, -1)
 
 def sliding_window(values: list[float], window_size: int = WINDOW_SIZE, overlap: float = 0.0) -> list[list[float]]:
@@ -165,28 +175,64 @@ def train_from_discharges(discharges: List[Discharge]) -> float:
     start_execution = time.time()
 
     X, y = [], []
-    num_tendency = 3 # We will add the past 3 features vectors as a tendency, to give the model more context
+    num_tendency = 3  # We will add the past 3 features vectors as a tendency
+    feature_size = 7  # Number of features per window
     
     if len(discharges) < num_tendency:
         raise ValueError(f"Not enough discharges to train the model, expected at least {num_tendency}, got {len(discharges)}")
     
     for discharge in discharges:
-        for signal in discharge.signals:
+        # Group windows from all signals by their time index
+        aligned_windows = {}
+        signal_indices = {}
+        
+        # First, collect windows from all signals
+        for signal_idx, signal in enumerate(discharge.signals):
             if len(signal.values) == 0:
                 continue
+                
             windows = sliding_window(signal.values)
-            for (i, window) in enumerate(windows):
-                if i < num_tendency:
-                    # Skip first few windows to ensure we have enough context
-                    continue
-                features = extract_features(window)
-                # Add past features as a tendency
-                for j in range(1, num_tendency + 1):
-                    if i - j >= 0:
-                        past_features = extract_features(windows[i - j])
-                        features = np.concatenate((features, past_features[0]))
-                X.append(features[0])
-                y.append(1 if is_anomaly(discharge) else 0)
+            for window_idx, window in enumerate(windows):
+                if window_idx not in aligned_windows:
+                    aligned_windows[window_idx] = []
+                    signal_indices[window_idx] = []
+                aligned_windows[window_idx].append(window)
+                signal_indices[window_idx].append(signal_idx)
+        
+        # Process aligned windows
+        for window_idx in sorted(aligned_windows.keys()):
+            if window_idx < num_tendency:
+                continue
+                
+            # Average features across all signals at this time point
+            current_window_features = np.zeros(feature_size)
+            for window in aligned_windows[window_idx]:
+                current_window_features += extract_features(window)[0]
+            
+            if len(aligned_windows[window_idx]) > 0:
+                current_window_features /= len(aligned_windows[window_idx])
+            
+            # Create feature vector with consistent size
+            all_features = [current_window_features]
+                
+            # Add tendency features (also averaged across signals)
+            for j in range(1, num_tendency + 1):
+                prev_idx = window_idx - j
+                if prev_idx in aligned_windows and len(aligned_windows[prev_idx]) > 0:
+                    prev_window_features = np.zeros(feature_size)
+                    for window in aligned_windows[prev_idx]:
+                        prev_window_features += extract_features(window)[0]
+                    prev_window_features /= len(aligned_windows[prev_idx])
+                    all_features.append(prev_window_features)
+                else:
+                    # If no previous window, use zeros
+                    all_features.append(np.zeros(feature_size))
+            
+            # Flatten and append to feature matrix
+            X.append(np.concatenate(all_features))
+            y.append(1 if is_anomaly(discharge) else 0)
+            
+        logger.info(f"Extracted features for discharge {discharge.id}")
 
     X_array = np.array(X)
     y_array = np.array(y)
@@ -198,19 +244,34 @@ def train_from_discharges(discharges: List[Discharge]) -> float:
     logger.info(f"Training with {len(X_array)} samples, {len(y_array)} labels, scale_pos_weight={scale_pos_weight}")
 
     params = {
+        # Algorithm and hardware settings
+        'tree_method': 'hist',
+        'n_jobs': -1,
+        # Objective and evaluation metrics
         'objective': 'binary:logistic',
-        'eval_metric': ['aucpr', 'logloss'],
+        'eval_metric': 'aucpr', # 'logloss'
+        # Regularization and overfitting control
+        'learning_rate': 0.05,
         'scale_pos_weight': scale_pos_weight,
-        'max_depth': 8,
-        'eta': 0.02,
-        'gamma': 1.0,
+        # Hyperparameters
+        'max_depth': 6,
         'min_child_weight': 3,
-        'subsample': 1.0,
+        'gamma': 1.0,
+        'eta': 0.02,
+        'subsample': 0.8,
         'colsample_bytree': 0.8,
+        # incremental learning
+        # 'process_type': 'update',
+        # 'refresh_leaf': true,
     }
 
     dtrain = xgb.DMatrix(X_array, label=y_array)
-    model = xgb.train(params, dtrain, num_boost_round=10000)
+    model = xgb.train(params, 
+                      dtrain, 
+                      num_boost_round=10000, 
+                    #   early_stopping_rounds=50 # To enable early stopping, we need a validation set
+                      verbose_eval=10
+                      )
 
     with open(MODEL_PATH, "wb") as f:
         pickle.dump(model, f)
@@ -259,51 +320,83 @@ async def predict(discharge: Discharge):
         raise HTTPException(
             status_code=400,
             detail=ErrorResponse(
-            error="Model not trained",
-            code="MODEL_NOT_FOUND",
-            details={"message": "Please train the model first"}
+                error="Model not trained",
+                code="MODEL_NOT_FOUND",
+                details={"message": "Please train the model first"}
             ).model_dump()
         )
     
     try:
-        # Check if there are discharges to process
-            
-        # Process all discharges for prediction
+        # Group windows from all signals by their time index
+        aligned_windows = {}
+        all_windows = []  # To store all windows for response
         all_predictions = []
         all_confidences = []
         wheighted_predictions = []
-        for signal in discharge.signals:
-
-                if len(signal.values) == 0:
-                    continue
+        feature_size = 7
+        num_tendency = 3
+        
+        # First, collect windows from all signals
+        for signal_idx, signal in enumerate(discharge.signals):
+            if len(signal.values) == 0:
+                continue
                 
-                # Generate sliding windows for the signal values
-                windows = sliding_window(signal.values)
-                
-                # Extract features from each window and predict for each
-                i = 0
-                for window in windows:
-                    i += 1
-                    features = extract_features(window)
-
-                    # Convert to DMatrix
-                    dtest = xgb.DMatrix(features)
+            windows = sliding_window(signal.values)
+            all_windows.extend(windows)  # Store windows for response
             
-                    # Make prediction
-                    prediction_probability = model.predict(dtest)[0]
-                    prediction = 1 if prediction_probability > 0.5 else 0
-                    weigthted_prediction = prediction_probability if prediction == 1 else -1 + prediction_probability
-                    wheighted_predictions.append(weigthted_prediction)
+            for window_idx, window in enumerate(windows):
+                if window_idx not in aligned_windows:
+                    aligned_windows[window_idx] = []
+                aligned_windows[window_idx].append(window)
+        
+        # Process aligned windows for prediction
+        for window_idx in sorted(aligned_windows.keys()):
+            if window_idx < num_tendency:
+                continue
+                
+            # Average features across all signals at this time point
+            current_window_features = np.zeros(feature_size)
+            for window in aligned_windows[window_idx]:
+                current_window_features += extract_features(window)[0]
+            
+            if len(aligned_windows[window_idx]) > 0:
+                current_window_features /= len(aligned_windows[window_idx])
+            
+            # Create feature vector with consistent size (matching training)
+            all_features = [current_window_features]
+                
+            # Add tendency features (also averaged across signals)
+            for j in range(1, num_tendency + 1):
+                prev_idx = window_idx - j
+                if prev_idx in aligned_windows and len(aligned_windows[prev_idx]) > 0:
+                    prev_window_features = np.zeros(feature_size)
+                    for window in aligned_windows[prev_idx]:
+                        prev_window_features += extract_features(window)[0]
+                    prev_window_features /= len(aligned_windows[prev_idx])
+                    all_features.append(prev_window_features)
+                else:
+                    # If no previous window, use zeros
+                    all_features.append(np.zeros(feature_size))
+            
+            # Flatten and prepare for prediction
+            features_array = np.concatenate(all_features).reshape(1, -1)
+            dtest = xgb.DMatrix(features_array)
+            
+            # Make prediction
+            prediction_probability = model.predict(dtest)[0]
+            prediction = 1 if prediction_probability > 0.5 else 0
+            weigthted_prediction = prediction_probability if prediction == 1 else -1 + prediction_probability
+            wheighted_predictions.append(weigthted_prediction)
 
-                    all_predictions.append(prediction)
-                    all_confidences.append(float(prediction_probability if prediction == 1 else 1 - prediction_probability))
-
+            all_predictions.append(prediction)
+            all_confidences.append(float(prediction_probability if prediction == 1 else 1 - prediction_probability))
+            
         # Determine overall prediction
-        # Use majority vote for final prediction
         final_prediction = 1 if sum(wheighted_predictions) > 0 else 0
         
         # Use average confidence
         avg_confidence = np.mean(all_confidences) if all_confidences else 0.0
+        
         # Calculate feature importance if available
         feature_importance = None
         try:
@@ -314,7 +407,26 @@ async def predict(discharge: Discharge):
             
         # Calculate execution time
         execution_time = (time.time() - start_execution) * 1000  # ms
-        
+
+        # DEBUG: Use matplotlib to visualize the feature importance and confidences
+        # import matplotlib.pyplot as plt
+
+        # if feature_importance:
+        #     plt.figure(figsize=(10, 6))
+        #     plt.barh(range(len(feature_importance)), feature_importance, align='center')
+        #     plt.xlabel('Feature Importance')
+        #     plt.ylabel('Features')
+        #     plt.title('XGBoost Feature Importance')
+        #     plt.show()
+
+        # if all_confidences:
+        #     plt.figure(figsize=(10, 6))
+        #     plt.hist(all_confidences, bins=20, alpha=0.7)
+        #     plt.xlabel('Confidence')
+        #     plt.ylabel('Frequency')
+        #     plt.title('Prediction Confidence Distribution')
+        #     plt.show()
+
         return PredictionResponse(
             prediction="Anomaly" if final_prediction == 1 else "Normal",
             confidence=float(avg_confidence) if final_prediction == 1 else 1 - float(avg_confidence),
@@ -360,7 +472,7 @@ async def increase_json_size_limit(request: Request, call_next):
 
 if __name__ == "__main__":
     # Set server settings for large JSON payloads
-    uvicorn.run("main:app", host="0.0.0.0", port=8003, reload=True, 
+    uvicorn.run("main:app", host="0.0.0.0", port=8003,
                 limit_concurrency=50, 
                 limit_max_requests=20000,
                 timeout_keep_alive=120)
