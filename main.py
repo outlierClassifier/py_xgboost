@@ -472,8 +472,5 @@ async def increase_json_size_limit(request: Request, call_next):
 
 if __name__ == "__main__":
     # Set server settings for large JSON payloads
-    uvicorn.run("main:app", host="0.0.0.0", port=8003,
-                limit_concurrency=50, 
-                limit_max_requests=20000,
-                timeout_keep_alive=120)
+    uvicorn.run("main:app", host="0.0.0.0", port=8003, timeout_keep_alive=120)
 
